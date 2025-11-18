@@ -15,10 +15,8 @@ public:
             return;
         }
 
-        // PPM Header
         ofs << "P6\n" << width << " " << height << "\n255\n";
 
-        // Data
         ofs.write(reinterpret_cast<const char*>(data.data()), data.size());
         
         ofs.close();

@@ -1,15 +1,17 @@
 #include "RayTracer.h"
 #include "ImageWriter.h"
+#include "Noise.h"
 #include <cmath>
 #include <iostream>
+
+Noise noise_gen;
 
 RayTracer::RayTracer(int width, int height) : width(width), height(height) {}
 
 void RayTracer::render(const std::string &filename) {
   std::vector<unsigned char> image(width * height * 3);
 
-  // Camera setup
-  Vec3 cam_pos(0, 0, -15); // Start far away on Z axis
+  Vec3 cam_pos(0, 1.0, -15);
   Vec3 cam_lookat(0, 0, 0);
   Vec3 cam_up(0, 1, 0);
 
@@ -26,18 +28,18 @@ void RayTracer::render(const std::string &filename) {
 #pragma omp parallel for schedule(dynamic)
   for (int j = 0; j < height; ++j) {
     for (int i = 0; i < width; ++i) {
-      // Normalized device coordinates
       double x = (2 * (i + 0.5) / (double)width - 1) * aspect_ratio * scale;
       double y = (1 - 2 * (j + 0.5) / (double)height) * scale;
 
       Vec3 dir = unit_vector(forward + x * right + y * up);
-
       State s = initial_state(cam_pos, dir);
 
       bool hit_horizon = false;
-      // Integration loop
-      for (int step = 0; step < 5000; ++step) {
-        integrate(s, step_size);
+      Vec3 accumulated_color(0, 0, 0);
+
+      for (int step = 0; step < 2000;
+           ++step) {
+        integrate(s, step_size, accumulated_color);
 
         if (s.r < horizon * 1.01) {
           hit_horizon = true;
@@ -48,16 +50,16 @@ void RayTracer::render(const std::string &filename) {
         }
       }
 
-      Vec3 color(0, 0, 0);
-      if (hit_horizon) {
-        color = Vec3(0, 0, 0); // Black hole shadow
-      } else {
-        // Map final direction to background
-        // We need to convert final spherical coords back to direction vector to
-        // sample a skybox Or just use theta/phi directly for a procedural
-        // pattern
-        color = get_color(s.theta, s.phi);
+      Vec3 color = accumulated_color;
+      if (!hit_horizon) {
+        color += get_color(s.theta, s.phi);
       }
+
+      Vec3 white(1, 1, 1);
+      Vec3 denom = color + white;
+      color = Vec3(color.x / denom.x, color.y / denom.y, color.z / denom.z);
+      color = Vec3(pow(color.x, 1 / 2.2), pow(color.y, 1 / 2.2),
+                   pow(color.z, 1 / 2.2));
 
       int idx = (j * width + i) * 3;
       image[idx] = static_cast<unsigned char>(std::min(255.0, color.x * 255));
@@ -75,20 +77,15 @@ void RayTracer::render(const std::string &filename) {
 }
 
 Vec3 RayTracer::get_color(double theta, double phi) {
-  // Simple procedural background: Checkerboard or Grid
-  // Map theta/phi to UV
   double u = phi / (2 * M_PI);
   double v = theta / M_PI;
 
-  // Galaxy band
   double galaxy = std::exp(-10.0 * (v - 0.5) * (v - 0.5));
 
-  // Grid lines
   bool grid = (int(u * 20) % 2 == 0) ^ (int(v * 10) % 2 == 0);
 
   Vec3 base = grid ? Vec3(0.1, 0.1, 0.2) : Vec3(0.05, 0.05, 0.1);
 
-  // Add galaxy band
   base += Vec3(0.8, 0.7, 0.5) * galaxy;
 
   return base;
@@ -96,13 +93,6 @@ Vec3 RayTracer::get_color(double theta, double phi) {
 
 State RayTracer::initial_state(const Vec3 &origin, const Vec3 &direction) {
   State s;
-
-  // Convert Cartesian (x,y,z) to Spherical (r, theta, phi)
-  // Assuming origin is in standard Cartesian where Z is axis?
-  // Actually, let's align physics coordinates with standard math:
-  // x = r sin theta cos phi
-  // y = r sin theta sin phi
-  // z = r cos theta
 
   double r = origin.length();
   double theta = acos(origin.z / r);
@@ -113,10 +103,6 @@ State RayTracer::initial_state(const Vec3 &origin, const Vec3 &direction) {
   s.theta = theta;
   s.phi = phi;
 
-  // Convert velocity vector (direction) to spherical basis
-  // We need to project 'direction' onto e_r, e_theta, e_phi
-
-  // Basis vectors at position (r, theta, phi)
   double st = sin(theta);
   double ct = cos(theta);
   double sp = sin(phi);
@@ -126,30 +112,16 @@ State RayTracer::initial_state(const Vec3 &origin, const Vec3 &direction) {
   Vec3 e_theta(ct * cp, ct * sp, -st);
   Vec3 e_phi(-sp, cp, 0);
 
-  // Local derivatives
   s.dr = dot(direction, e_r);
   s.dtheta = dot(direction, e_theta) / r;
   s.dphi = dot(direction, e_phi) / (r * st);
-
-  // Initial dt/dlambda for a photon
-  // Null geodesic condition: ds^2 = 0
-  // -(1-2M/r)dt^2 + (1-2M/r)^-1 dr^2 + r^2 dtheta^2 + r^2 sin^2theta dphi^2 = 0
-  // (1-2M/r)dt^2 = (1-2M/r)^-1 dr^2 + r^2 (dtheta^2 + sin^2theta dphi^2)
-  // dt = sqrt( (1-2M/r)^-2 dr^2 + (1-2M/r)^-1 r^2 (...) )
 
   double metric_rr = 1.0 / (1.0 - 2.0 * M / r);
   double metric_ang = r * r * (s.dtheta * s.dtheta + st * st * s.dphi * s.dphi);
   double rhs = metric_rr * s.dr * s.dr + metric_ang;
 
-  // (1-2M/r) dt^2 = rhs
-  // dt^2 = rhs / (1-2M/r)
-
   double factor = (1.0 - 2.0 * M / r);
-  s.dt = sqrt(rhs / factor) / sqrt(factor); // Wait, check algebra
-
-  // (1-2M/r) dt^2 = (1-2M/r)^-2 dr^2 + (1-2M/r)^-1 r^2 dOmega^2
-  // dt^2 = (1-2M/r)^-2 dr^2 + (1-2M/r)^-1 r^2 dOmega^2
-  // dt = sqrt(...)
+  s.dt = sqrt(rhs / factor) / sqrt(factor);
 
   s.dt = sqrt((s.dr * s.dr) / pow(factor, 2) +
               (r * r * (s.dtheta * s.dtheta + st * st * s.dphi * s.dphi)) /
@@ -159,9 +131,6 @@ State RayTracer::initial_state(const Vec3 &origin, const Vec3 &direction) {
 }
 
 void RayTracer::derivatives(const State &s, State &out) {
-  // Geodesic equations for Schwarzschild metric
-  // \ddot{x}^\mu = -\Gamma^\mu_{\alpha\beta} \dot{x}^\alpha \dot{x}^\beta
-
   double r = s.r;
   double theta = s.theta;
 
@@ -170,15 +139,6 @@ void RayTracer::derivatives(const State &s, State &out) {
   double st = sin(theta);
   double ct = cos(theta);
   double st_2 = st * st;
-
-  // Non-zero Christoffel symbols (M=1 assumed in formulas, but using variable
-  // M) G^t_tr = M / (r(r-2M)) G^r_tt = M(r-2M) / r^3 G^r_rr = -M / (r(r-2M))
-  // G^r_thth = -(r-2M)
-  // G^r_phph = -(r-2M)sin^2theta
-  // G^th_rth = 1/r
-  // G^th_phph = -sin(theta)cos(theta)
-  // G^ph_rph = 1/r
-  // G^ph_thph = cot(theta)
 
   double G_t_tr = M / (r * (r - 2.0 * M));
   double G_r_tt = M * (r - 2.0 * M) / r_3;
@@ -190,18 +150,14 @@ void RayTracer::derivatives(const State &s, State &out) {
   double G_ph_rph = 1.0 / r;
   double G_ph_thph = ct / st;
 
-  // \ddot{t} = -2 * G^t_tr * dt * dr
   double ddt = -2.0 * G_t_tr * s.dt * s.dr;
 
-  // \ddot{r} = - (G^r_tt dt^2 + G^r_rr dr^2 + G^r_thth dth^2 + G^r_phph dph^2)
   double ddr = -(G_r_tt * s.dt * s.dt + G_r_rr * s.dr * s.dr +
                  G_r_thth * s.dtheta * s.dtheta + G_r_phph * s.dphi * s.dphi);
 
-  // \ddot{theta} = - (2 * G^th_rth * dr * dth + G^th_phph * dph^2)
   double ddtheta =
       -(2.0 * G_th_rth * s.dr * s.dtheta + G_th_phph * s.dphi * s.dphi);
 
-  // \ddot{phi} = - (2 * G^ph_rph * dr * dph + 2 * G^ph_thph * dth * dph)
   double ddphi =
       -(2.0 * G_ph_rph * s.dr * s.dphi + 2.0 * G_ph_thph * s.dtheta * s.dphi);
 
@@ -216,14 +172,26 @@ void RayTracer::derivatives(const State &s, State &out) {
   out.dphi = ddphi;
 }
 
-void RayTracer::integrate(State &s, double h) {
+Vec3 RayTracer::get_disk_color(double r, double phi) {
+  double temp = 1.0 / (r - 1.5 * M);
+
+  double n = noise_gen.turbulence(r * 2.0, phi * 5.0, 0.0, 4);
+  double intensity = temp * (0.5 + 0.5 * n);
+
+  Vec3 color(1.0, 0.8, 0.6);
+  color *= intensity * 0.5;
+
+  return color;
+}
+
+void RayTracer::integrate(State &s, double h, Vec3 &accumulated_color) {
   State k1, k2, k3, k4;
   State temp;
 
-  // k1
+  double old_theta = s.theta;
+
   derivatives(s, k1);
 
-  // k2
   temp = s;
   temp.t += k1.t * h * 0.5;
   temp.r += k1.r * h * 0.5;
@@ -235,7 +203,6 @@ void RayTracer::integrate(State &s, double h) {
   temp.dphi += k1.dphi * h * 0.5;
   derivatives(temp, k2);
 
-  // k3
   temp = s;
   temp.t += k2.t * h * 0.5;
   temp.r += k2.r * h * 0.5;
@@ -247,7 +214,6 @@ void RayTracer::integrate(State &s, double h) {
   temp.dphi += k2.dphi * h * 0.5;
   derivatives(temp, k3);
 
-  // k4
   temp = s;
   temp.t += k3.t * h;
   temp.r += k3.r * h;
@@ -259,7 +225,6 @@ void RayTracer::integrate(State &s, double h) {
   temp.dphi += k3.dphi * h;
   derivatives(temp, k4);
 
-  // Update
   s.t += h * (k1.t + 2 * k2.t + 2 * k3.t + k4.t) / 6.0;
   s.r += h * (k1.r + 2 * k2.r + 2 * k3.r + k4.r) / 6.0;
   s.theta += h * (k1.theta + 2 * k2.theta + 2 * k3.theta + k4.theta) / 6.0;
@@ -269,4 +234,36 @@ void RayTracer::integrate(State &s, double h) {
   s.dr += h * (k1.dr + 2 * k2.dr + 2 * k3.dr + k4.dr) / 6.0;
   s.dtheta += h * (k1.dtheta + 2 * k2.dtheta + 2 * k3.dtheta + k4.dtheta) / 6.0;
   s.dphi += h * (k1.dphi + 2 * k2.dphi + 2 * k3.dphi + k4.dphi) / 6.0;
+
+  double new_theta = s.theta;
+
+  if ((old_theta - M_PI_2) * (new_theta - M_PI_2) <= 0) {
+    double f = std::abs(old_theta - M_PI_2) /
+               (std::abs(old_theta - M_PI_2) + std::abs(new_theta - M_PI_2));
+    double r_cross = s.r * f + (s.r - k1.r * h) * (1 - f);
+    r_cross = s.r;
+
+    if (r_cross > disk_inner && r_cross < disk_outer) {
+      Vec3 disk_col = get_disk_color(r_cross, s.phi);
+
+      double Omega = sqrt(M / pow(r_cross, 3));
+      double u_t = 1.0 / sqrt(1.0 - 3.0 * M / r_cross);
+      double u_phi = Omega * u_t;
+
+      double g_tt = -(1.0 - 2.0 * M / r_cross);
+      double g_phph = r_cross * r_cross;
+
+      double E_emit = -(g_tt * u_t * s.dt + g_phph * u_phi * s.dphi);
+      double E_obs = 1.0;
+
+      double redshift = E_emit / E_obs;
+      double doppler = 1.0 / redshift;
+
+      double beaming = pow(doppler, 4.0);
+
+      beaming = std::min(beaming, 20.0);
+
+      accumulated_color += disk_col * beaming * 0.3;
+    }
+  }
 }
